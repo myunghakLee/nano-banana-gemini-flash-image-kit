@@ -129,13 +129,6 @@ Applied to:
 
 ## Default Prompt
 
-If you don’t provide `--prompt`, this prompt is used:
-
-```text
-Ultra realistic collectible figure/statue of [character / style / pose] naturally placed on a computer desk,
-entire figure fully in frame including the base (no cropping).
-Primary focus on the face: eyes crisp with natural catchlights, clean paint masks around eyes and mouth,
-facial features clearly readable, no smoothing or waxy look.
-```
+If you don’t provide `--prompt`, `default_prompt.txt` file is used
 
 ---
