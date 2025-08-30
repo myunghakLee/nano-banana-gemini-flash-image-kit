@@ -9,8 +9,13 @@ from PIL import Image
 import argparse
 import textwrap
 import random
+import shutil
+import base64
 import json
 import os
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 SafetyList = List[Dict[str, str]]
 
@@ -18,15 +23,24 @@ class Gemini:
     def __init__(self, api_key_file: Union[str, Path], model: str = "gemini-2.5-flash-image-preview"):
         # Read API key from file
         key_path = Path(api_key_file)
-        self.api_key = key_path.read_text(encoding="utf-8").strip()
+        # Handle potential UTF-16 BOM encoding
+        try:
+            self.api_key = key_path.read_text(encoding="utf-8").strip()
+        except UnicodeDecodeError:
+            self.api_key = key_path.read_text(encoding="utf-16").strip()
 
         # Select model (2.5 image preview by default)
         self.model = model
         self.client = genai.Client(api_key=self.api_key)
 
         # Default prompt (feel free to override on call)
-        self.default_prompt = open("default_prompt.txt").readlines()
-        self.default_prompt = " ".join([line.strip() for line in self.default_prompt if line.strip()]) 
+        self.default_prompt = open("default_prompt.txt", "rb").readlines()
+        self.default_prompt = " ".join([
+                                            line.decode("utf-8").strip()  # decode 추가
+                                            for line in self.default_prompt
+                                            if line.strip()
+                                        ])
+
         self.default_prompt = textwrap.dedent(self.default_prompt).strip()
 
     def _ensure_bytes(self, data):
@@ -54,11 +68,6 @@ class Gemini:
             sig.startswith(b"BM")
         )
 
-    # saved_paths = []
-    # text_chunks = []
-
-
-
     # ---------- utils ----------
     def _ensure_pil(self, img_or_path: Union[str, Path, Image.Image]) -> Image.Image:
         """Return a PIL.Image regardless of whether input is a path or already an Image."""
@@ -69,20 +78,20 @@ class Gemini:
     def _base_out(
         self,
         input_img: Union[str, Path, Image.Image],
-        outputs_dir: Union[str, Path] = "outputs",
+        output_folder: Union[str, Path] = "Output",
         suffix: str = "_gemini",
         default_ext: str = ".png"
-    ) -> (Path, str, str):
+    ) -> tuple[Path, str, str]:
         """
         Build base output directory and name components.
 
         Returns:
             (out_dir, base_stem, ext)
-            - out_dir: Path to outputs directory
+            - out_dir: Path to output directory
             - base_stem: base filename stem with suffix applied
             - ext: extension to use for images
         """
-        out_dir = Path(outputs_dir)
+        out_dir = Path(output_folder)
         out_dir.mkdir(parents=True, exist_ok=True)
         if isinstance(input_img, (str, Path)):
             in_path = Path(input_img)
@@ -189,7 +198,7 @@ class Gemini:
         self,
         input_img: Union[str, Path, Image.Image, None],
         prompt: Optional[str] = None,
-        outputs_dir: Union[str, Path] = "outputs",
+        output_folder: Union[str, Path] = "Output",
         save_text: bool = True,
         safety_mode: Optional[str] = "off",            # "off" | "relaxed" | "balanced" | "strict"
         safety_settings: Optional[SafetyList] = None, # overrides safety_mode if provided
@@ -199,7 +208,6 @@ class Gemini:
         seed: Optional[int] = None,
         candidate_count: Optional[int] = None,
         max_output_tokens: Optional[int] = None,
-        save_option: bool = False,
         **kwargs
     ):
         """
@@ -207,9 +215,9 @@ class Gemini:
 
         Behavior:
           - Saves ALL image parts found in the response:
-              outputs/<stem>_gemini_1<ext>, outputs/<stem>_gemini_2<ext>, ...
+              output/<stem>_gemini_1<ext>, output/<stem>_gemini_2<ext>, ...
           - Optionally saves text captions to:
-              outputs/<stem>_gemini.txt
+              output/<stem>_gemini.txt
           - Safety can be controlled via `safety_mode` or `safety_settings`.
           - Sampling can be controlled with temperature/top_p/top_k/seed/candidate_count/max_output_tokens.
         """
@@ -217,12 +225,21 @@ class Gemini:
             prompt = self.default_prompt
 
         # Determine base output naming
-        out_dir, base_stem, ext = self._base_out(input_img, outputs_dir=outputs_dir)
+        out_dir, base_stem, ext = self._base_out(input_img, output_folder=output_folder)
 
         # Build input contents: text + optional image
         contents = [prompt]
         if input_img is not None:
             pil_img = self._ensure_pil(input_img)
+            prev_size = pil_img.size
+
+            if pil_img.width > 1536 or pil_img.height > 1536:
+                scale = min(1536 / pil_img.width, 1536 / pil_img.height)
+
+                pil_img = pil_img.resize((int(pil_img.size[0] * scale), int(pil_img.size[1] * scale)), Image.LANCZOS)
+            if pil_img.size != prev_size:
+                print(f"Down sized image : {prev_size}  --> {pil_img.size}")
+
             contents.append(pil_img)
 
         # Compose config (modalities, safety, and sampling)
@@ -295,8 +312,10 @@ class Gemini:
                 print(f"[OK] Saved {len(saved_paths)} image(s):")
                 for pth in saved_paths:
                     print("  -", pth.resolve())
+                
             else:
-                print("[INFO] No image parts returned.")
+                # print("[INFO] No image parts returned.")
+                return None, None
 
 
             return saved_paths, txt_saved
@@ -304,6 +323,8 @@ class Gemini:
         except errors.APIError as e:
             # Basic error diagnostics (helpful for quota/safety issues)
             print(f"[APIError] code={getattr(e,'code',None)} message={getattr(e,'message','')}")
+            print(f"\tmessage: {getattr(e, 'message', '')}")
+            print(f"\tdetails: {getattr(e, 'details', '')}")
             data = getattr(e, "response_json", {}) or {}
             details = data.get("error", {}).get("details", [])
             for d in details:
@@ -313,14 +334,53 @@ class Gemini:
                     print("[Quota Violations]", viols)
                 if t.endswith("RetryInfo") and "retryDelay" in d:
                     print("[RetryInfo]", d["retryDelay"])
-            return [], None
+            return None, None
 
 
+    def processing(self, input_img, 
+                   input_folder,
+                   output_folder,
+                   save_origin,
+                   save_option,
+                   api_semaphore,
+                   api_rate_limit,
+                   **kwargs):
+        """병렬 처리를 위한 래퍼 함수 - API 제한 적용"""
+        with api_semaphore:  # 동시 API 호출 수 제한
+            try:
+                time.sleep(api_rate_limit)  # API 호출 간격 제한
+                
+                saved_paths, _ = self.make_image(
+                    input_img=input_img,
+                    output_folder=output_folder,
+                    **kwargs
+                )
+                
+                not_generated_files = []
+                if not saved_paths:
+                    not_generated_files.append(input_img)
+                    os.makedirs(f"fail/{input_folder}", exist_ok=True)
+                    shutil.copy(input_img, f"fail/{input_folder}/{os.path.basename(input_img)}")
+                    print("[FAIL] No Image")
+                    print(f"  - {input_img}")
+                elif save_origin:
+                    shutil.copy(input_img, f"{output_folder}/{os.path.basename(input_img)}")
+                elif save_option:
+                    # Save the options used for this file
+                    json_path = saved_paths[0].with_suffix(".json")
+                    with open(json_path, "w", encoding="utf-8") as jf:
+                        json.dump(kwargs, jf, ensure_ascii=False, indent=4)
+                        
+                return not_generated_files, input_img  # 파일명도 함께 반환
+                
+            except Exception as e:
+                print(f"[ERROR] Failed to process {input_img}: {e}")
+                return [input_img], input_img
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Gemini Flash Image Generation/Editing Example")
-    parser.add_argument("--outputs-dir", default="Outputs", help="Directory to save output images")
-    parser.add_argument("--input-file", default="Inputs", help="Path to the input image file")
+    parser.add_argument("--output-folder", default="Output", help="Directory to save output images")
+    parser.add_argument("--input-folder", default="Inputs", help="Path to the input image file")
     parser.add_argument("--api-key-file", default="./gemini_api_key.txt", help="Path to the API key file")
     parser.add_argument("--model", default="gemini-2.5-flash-image-preview", help="Model to use for image generation")
     parser.add_argument("--top-p", type=float, default=0.7, help="Nucleus sampling probability")
@@ -329,7 +389,10 @@ if __name__ == "__main__":
     parser.add_argument("--safety-mode", default="off", choices=["off", "relaxed", "balanced", "strict"], help="Safety mode")
     parser.add_argument("--save-text", action="store_true", help="Whether to save text captions")
     parser.add_argument("--save-option", action="store_true", help="Whether to save options")
+    parser.add_argument("--save-origin", action="store_true", help="Whether to save original image")
     parser.add_argument("--prompt", type=str, default=None, help="Override default prompt")
+    parser.add_argument("--max-workers", type=int, default=3, help="Maximum number of concurrent threads")
+    parser.add_argument("--api-rate-limit", type=float, default=0.5, help="Minimum interval between API calls (seconds)")
     args = parser.parse_args()
     if args.seed is None:
         args.seed = random.randint(1, 2**31 - 1)
@@ -339,22 +402,48 @@ if __name__ == "__main__":
 
     EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff", ".heic", ".heif", ".avif"}
     files = sorted(
-            str(p) for p in Path(args.input_file).rglob("*")
+            str(p) for p in Path(args.input_folder).rglob("*")
             if p.is_file() and p.suffix.lower() in EXTS
     )
+    if not files:
+        print(f"No image files found in {args.input_folder}")
+        exit(0)
+    
+    print(f"Found {len(files)} image files. Processing with max {args.max_workers} concurrent threads...")
+    print(f"API rate limit: {args.api_rate_limit}s between calls")
+    
+    # API 호출 제한을 위한 세마포어 생성
+    api_semaphore = threading.Semaphore(args.max_workers)
+    
+    not_generated_files = []
+    for _ in range(1):
+        # 병렬 처리 with ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
+            # 모든 작업 제출
+            future_to_file = {
+                executor.submit(
+                    g.processing,
+                    input_img=file,
+                    api_semaphore=api_semaphore,
+                    **vars(args),
+                ): file for file in files
+            }
+            
+            # 완료된 작업들 처리
+            completed = 0
+            for future in as_completed(future_to_file):
+                file = future_to_file[future]
+                completed += 1
+                try:
+                    failed_files, processed_file = future.result()
+                    not_generated_files.extend(failed_files)
+                except Exception as e:
+                    not_generated_files.append(file)
+                    print(f"[{completed}/{len(files)}] Failed: {os.path.basename(file)} - {e}")
 
-    for file in files:
-        try:
-            # Example: edit with sampling controls + relaxed safety, also save caption
-            saved_paths, _ = g.make_image(
-                input_img=file,
-                **vars(args)
-            )
-
-            if args.save_option and saved_paths:
-                # Save the options used for this file
-                json_path = saved_paths[0].with_suffix(".json")
-                with open(json_path, "w", encoding="utf-8") as jf:
-                    json.dump(vars(args), jf, ensure_ascii=False, indent=4)
-        except Exception as e:
-            print(f"[ERROR] Failed to process {file}: {e}")
+        print(f"\nProcessing completed!")
+        print(f"Successfully processed: {len(files) - len(not_generated_files)}/{len(files)}")
+        if not_generated_files:
+            print(f"Failed files: {set(os.path.basename(f) for f in not_generated_files)}")
+        else:
+            print("All files processed successfully!")
