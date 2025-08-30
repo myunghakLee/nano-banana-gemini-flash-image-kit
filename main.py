@@ -416,34 +416,33 @@ if __name__ == "__main__":
     api_semaphore = threading.Semaphore(args.max_workers)
     
     not_generated_files = []
-    for _ in range(1):
-        # 병렬 처리 with ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
-            # 모든 작업 제출
-            future_to_file = {
-                executor.submit(
-                    g.processing,
-                    input_img=file,
-                    api_semaphore=api_semaphore,
-                    **vars(args),
-                ): file for file in files
-            }
-            
-            # 완료된 작업들 처리
-            completed = 0
-            for future in as_completed(future_to_file):
-                file = future_to_file[future]
-                completed += 1
-                try:
-                    failed_files, processed_file = future.result()
-                    not_generated_files.extend(failed_files)
-                except Exception as e:
-                    not_generated_files.append(file)
-                    print(f"[{completed}/{len(files)}] Failed: {os.path.basename(file)} - {e}")
+    # 병렬 처리 with ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
+        # 모든 작업 제출
+        future_to_file = {
+            executor.submit(
+                g.processing,
+                input_img=file,
+                api_semaphore=api_semaphore,
+                **vars(args),
+            ): file for file in files
+        }
+        
+        # 완료된 작업들 처리
+        completed = 0
+        for future in as_completed(future_to_file):
+            file = future_to_file[future]
+            completed += 1
+            try:
+                failed_files, processed_file = future.result()
+                not_generated_files.extend(failed_files)
+            except Exception as e:
+                not_generated_files.append(file)
+                print(f"[{completed}/{len(files)}] Failed: {os.path.basename(file)} - {e}")
 
-        print(f"\nProcessing completed!")
-        print(f"Successfully processed: {len(files) - len(not_generated_files)}/{len(files)}")
-        if not_generated_files:
-            print(f"Failed files: {set(os.path.basename(f) for f in not_generated_files)}")
-        else:
-            print("All files processed successfully!")
+    print(f"\nProcessing completed!")
+    print(f"Successfully processed: {len(files) - len(not_generated_files)}/{len(files)}")
+    if not_generated_files:
+        print(f"Failed files: {set(os.path.basename(f) for f in not_generated_files)}")
+    else:
+        print("All files processed successfully!")
