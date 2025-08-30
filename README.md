@@ -102,7 +102,7 @@ python main.py \
 - `--safety-mode` (`off|relaxed|balanced|strict`, default: `off`) — safety preset
 - `--save-text` (flag) — also write a caption file for text parts returned by the model
 - `--save-option` (flag) — save a JSON dump of the CLI args next to the _first_ saved image for each input
-- `--prompt` (str, default: built‑in) — override the script’s default prompt
+- `--save-origin` (flag) — save the original image along with the output image
 - `--max-workers` (int, defaut: 3) — The number of data processed at once
   > Tip: run `python main.py -h` to see help.
 
