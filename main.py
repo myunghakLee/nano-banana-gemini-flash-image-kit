@@ -1,47 +1,80 @@
 # pip install -U google-genai pillow
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Union, List, Dict, Optional
-from google.genai import errors
-from google import genai
 from pathlib import Path
 from io import BytesIO
-from PIL import Image
+import threading
 import argparse
 import textwrap
 import random
 import shutil
 import base64
 import json
-import os
-import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import os
+
+from google.genai import errors
+from google import genai
+from PIL import Image
 
 SafetyList = List[Dict[str, str]]
 
-class Gemini:
-    def __init__(self, api_key_file: Union[str, Path], model: str = "gemini-2.5-flash-image-preview"):
-        # Read API key from file
-        key_path = Path(api_key_file)
-        # Handle potential UTF-16 BOM encoding
-        try:
-            self.api_key = key_path.read_text(encoding="utf-8").strip()
-        except UnicodeDecodeError:
-            self.api_key = key_path.read_text(encoding="utf-16").strip()
+class GeminiBatchImageGenerator:
+    def __init__(self,  api_key_file, input_folder, output_folder, model, top_p, top_k, temperature, seed, safety_mode, save_text,
+                 save_origin, api_rate_limit, max_attempts_count, prompt=None, safety_settings = None, **kwargs):
 
-        # Select model (2.5 image preview by default)
+        # Initialize instance variables
+        self.input_folder = input_folder
+        self.output_folder = output_folder
+        self.top_p = top_p
+        self.top_k = top_k
+        self.temperature = temperature
+        self.seed = seed
+        self.safety_mode = safety_mode
+        self.safety_settings = safety_settings
+        self.save_text = save_text
+        self.save_origin = save_origin
+        self.api_rate_limit = api_rate_limit
+        self.max_attempts_count = max_attempts_count
         self.model = model
+
+        # Load API key and default prompt
+        self.api_key = self._load_api_key(api_key_file)
         self.client = genai.Client(api_key=self.api_key)
 
-        # Default prompt (feel free to override on call)
-        self.default_prompt = open("default_prompt.txt", "rb").readlines()
-        self.default_prompt = " ".join([
-                                            line.decode("utf-8").strip()  # decode 추가
-                                            for line in self.default_prompt
-                                            if line.strip()
-                                        ])
+        if prompt is None:
+            self.default_prompt = self._load_default_prompt("default_prompt.txt")
+        else:
+            self.default_prompt = prompt
 
-        self.default_prompt = textwrap.dedent(self.default_prompt).strip()
+        self.gen_config = self._make_gen_config()
+
+
+
+
+    def set_attr(self, **kwargs):
+        for k, v in kwargs.items():
+            if hasattr(self, k):
+                setattr(self, k, v)
+            else:
+                print(f"Warning: {k} is not a valid attribute.")
+        self.gen_config = self._make_gen_config()
+        return self._make_gen_config()
+
+
+    def _load_api_key(self, file_path: str) -> str:
+        p = Path(file_path)
+        try:
+            return p.read_text(encoding="utf-8-sig").strip()
+        except UnicodeDecodeError:
+            return p.read_text(encoding="utf-16").strip()
+
+    def _load_default_prompt(self, path: str) -> str:
+        # UTF-8 및 UTF-8 BOM 자동 처리(utf-8-sig). 줄 단위로 읽어 공백/빈줄 제거 후 공백 하나로 합치기.
+        text = Path(path).read_text(encoding="utf-8-sig")
+        merged = " ".join(line.strip() for line in text.splitlines() if line.strip())
+        return textwrap.dedent(merged).strip()
 
     def _ensure_bytes(self, data):
         # Google SDK가 str(base64) 또는 bytes를 줄 수 있으니 모두 처리
@@ -75,13 +108,7 @@ class Gemini:
             return img_or_path
         return Image.open(str(img_or_path))
 
-    def _base_out(
-        self,
-        input_img: Union[str, Path, Image.Image],
-        output_folder: Union[str, Path] = "Output",
-        suffix: str = "_gemini",
-        default_ext: str = ".png"
-    ) -> tuple[Path, str, str]:
+    def _base_out(self, input_img: Union[str, Path, Image.Image], suffix: str = "__gemini", default_ext: str = ".png") -> tuple[Path, str, str]:
         """
         Build base output directory and name components.
 
@@ -91,7 +118,7 @@ class Gemini:
             - base_stem: base filename stem with suffix applied
             - ext: extension to use for images
         """
-        out_dir = Path(output_folder)
+        out_dir = Path(self.output_folder)
         out_dir.mkdir(parents=True, exist_ok=True)
         if isinstance(input_img, (str, Path)):
             in_path = Path(input_img)
@@ -102,7 +129,7 @@ class Gemini:
             stem = "image" + suffix
         return out_dir, stem, ext
 
-    def _build_safety(self, mode: Optional[str] = None, explicit: Optional[SafetyList] = None) -> Optional[SafetyList]:
+    def _build_safety(self) -> Optional[SafetyList]:
         """
         Build safety settings.
 
@@ -119,19 +146,19 @@ class Gemini:
         Returns:
             A list of safety settings or None.
         """
-        if explicit:
-            return explicit
+        if self.safety_settings:
+            return self.safety_settings
 
-        if not mode:
+        if not self.safety_mode:
             return None
 
-        if mode.lower() == "off":
+        if self.safety_mode.lower() == "off":
             thr = "BLOCK_NONE"
-        elif mode.lower() == "relaxed":
+        elif self.safety_mode.lower() == "relaxed":
             thr = "BLOCK_ONLY_HIGH"
-        elif mode.lower() == "balanced":
+        elif self.safety_mode.lower() == "balanced":
             thr = "BLOCK_MEDIUM_AND_ABOVE"
-        elif mode.lower() == "strict":
+        elif self.safety_mode.lower() == "strict":
             thr = "BLOCK_LOW_AND_ABOVE"
         else:
             raise ValueError("Unknown safety mode. Choose: off, relaxed, balanced, strict")
@@ -145,19 +172,7 @@ class Gemini:
         ]
         return [{"category": c, "threshold": thr} for c in cats]
 
-    def _make_gen_config(
-        self,
-        want_text: bool,
-        safety_mode: Optional[str],
-        safety_list: Optional[SafetyList],
-        *,
-        temperature: Optional[float] = None,
-        top_p: Optional[float] = None,
-        top_k: Optional[int] = None,
-        seed: Optional[int] = None,
-        candidate_count: Optional[int] = None,
-        max_output_tokens: Optional[int] = None
-    ):
+    def _make_gen_config(self, candidate_count: Optional[int] = None, max_output_tokens: Optional[int] = None):
         """
         Compose generation config including modalities, safety, and sampling parameters.
         Notes:
@@ -169,156 +184,132 @@ class Gemini:
             # Gemini 2.0 preview image generation tends to be stable with BOTH IMAGE and TEXT
             resp_modalities = ["IMAGE", "TEXT"]
         else:
-            resp_modalities = ["IMAGE", "TEXT"] if want_text else ["IMAGE"]
+            resp_modalities = ["IMAGE", "TEXT"] if self.save_text else ["IMAGE"]
 
         cfg: Dict[str, object] = {"response_modalities": resp_modalities}
 
         # Sampling / decoding params (only include if provided)
-        if temperature is not None:
-            cfg["temperature"] = float(temperature)
-        if top_p is not None:
-            cfg["top_p"] = float(top_p)
-        if top_k is not None:
-            cfg["top_k"] = int(top_k)
-        if seed is not None:
-            cfg["seed"] = int(seed)
+        if self.temperature is not None:
+            cfg["temperature"] = float(self.temperature)
+        if self.top_p is not None:
+            cfg["top_p"] = float(self.top_p)
+        if self.top_k is not None:
+            cfg["top_k"] = int(self.top_k)
+        if self.seed is not None:
+            cfg["seed"] = int(self.seed)
         if candidate_count is not None:
             cfg["candidate_count"] = int(candidate_count)
         if max_output_tokens is not None:
             cfg["max_output_tokens"] = int(max_output_tokens)
 
         # Optional safety settings (mode or explicit list)
-        s = self._build_safety(safety_mode, safety_list)
+        s = self._build_safety()
         if s:
             cfg["safety_settings"] = s
         return cfg
+    
+    def _make_gen_config_with_seed(self, seed=None, candidate_count=None, max_output_tokens=None):
+        cfg = self._make_gen_config(candidate_count, max_output_tokens)
+        cfg["seed"] = int(seed if seed is not None else random.randint(1, 2**31 - 1))
+        return cfg
+
+    def get_image(self, input_img):
+        pil_img = self._ensure_pil(input_img)
+        prev_size = pil_img.size
+
+        if pil_img.width > 3072 or pil_img.height > 3072:
+            scale = min(3072 / pil_img.width, 3072 / pil_img.height)
+
+            pil_img = pil_img.resize((int(pil_img.size[0] * scale), int(pil_img.size[1] * scale)), Image.LANCZOS)
+        # if pil_img.size != prev_size:
+        #     print(f"Down sized image : {prev_size}  --> {pil_img.size}")
+
+        return pil_img
+
+    def save_all_images(self, resp, out_dir, base_stem, ext, seed_idx):
+        saved_path, text_chunk = [], []
+        img_idx = 0
+        txt_path = out_dir / f"{base_stem}.txt"
+        for cand in getattr(resp, "candidates", []):
+            parts = getattr(cand, "content", None)
+            parts = getattr(parts, "parts", []) if parts else []
+            for p in parts:
+                # Image parts
+                if getattr(p, "inline_data", None) and getattr(p.inline_data, "mime_type", "").startswith("image/"):
+                    raw = self._ensure_bytes(p.inline_data.data)
+
+                    if not self._looks_like_image(raw):
+                        dbg_path = out_dir / f"{base_stem}_invalid_{img_idx+1}.bin"
+                        with open(dbg_path, "wb") as f:
+                            f.write(raw if isinstance(raw, (bytes, bytearray)) else bytes(raw))
+                        print(f"[WARN] Not a valid image signature. Dumped bytes to: {dbg_path}")
+                        continue
+
+
+                    img_idx += 1
+                    img = Image.open(BytesIO(raw))
+                    img.load()
+                    out_path = out_dir / f"{base_stem}_{img_idx}{ext}"
+                    while os.path.exists(out_path):
+                        img_idx += 1
+                        out_path = out_dir / f"{base_stem}_{img_idx}{ext}"
+                    img.save(out_path)
+                    saved_path.append(out_path)
+                    txt_path = out_dir / f"{base_stem}_{img_idx}.txt"
+                # Text parts
+                if getattr(p, "text", None):
+                    text_chunk.append(p.text)
+
+        # Log results
+        txt_saved = None
+        if saved_path:
+            print(f"[OK] Saved {len(saved_path)} image(s) in {seed_idx+1} attempt(s):")
+            for pth in saved_path:
+                print("  -", pth.resolve())
+            if self.save_text and text_chunk:
+                txt_path.write_text("\n\n---\n\n".join(text_chunk), encoding="utf-8")
+                txt_saved = txt_path
+            
+
+        return saved_path, txt_saved
+        
 
     # ---------- main ----------
-    def make_image(
-        self,
-        input_img: Union[str, Path, Image.Image, None],
-        prompt: Optional[str] = None,
-        output_folder: Union[str, Path] = "Output",
-        save_text: bool = True,
-        safety_mode: Optional[str] = "off",            # "off" | "relaxed" | "balanced" | "strict"
-        safety_settings: Optional[SafetyList] = None, # overrides safety_mode if provided
-        temperature: Optional[float] = None,
-        top_p: Optional[float] = None,
-        top_k: Optional[int] = None,
-        seed: Optional[int] = None,
-        candidate_count: Optional[int] = None,
-        max_output_tokens: Optional[int] = None,
-        **kwargs
-    ):
-        """
-        Generate or edit an image with the selected model.
-
-        Behavior:
-          - Saves ALL image parts found in the response:
-              output/<stem>_gemini_1<ext>, output/<stem>_gemini_2<ext>, ...
-          - Optionally saves text captions to:
-              output/<stem>_gemini.txt
-          - Safety can be controlled via `safety_mode` or `safety_settings`.
-          - Sampling can be controlled with temperature/top_p/top_k/seed/candidate_count/max_output_tokens.
-        """
+    def make_image(self, input_img: Union[str, Path, Image.Image, None], prompt: Optional[str] = None):
         if prompt is None:
             prompt = self.default_prompt
 
         # Determine base output naming
-        out_dir, base_stem, ext = self._base_out(input_img, output_folder=output_folder)
+        out_dir, base_stem, ext = self._base_out(input_img)
 
         # Build input contents: text + optional image
         contents = [prompt]
-        if input_img is not None:
-            pil_img = self._ensure_pil(input_img)
-            prev_size = pil_img.size
-
-            if pil_img.width > 1536 or pil_img.height > 1536:
-                scale = min(1536 / pil_img.width, 1536 / pil_img.height)
-
-                pil_img = pil_img.resize((int(pil_img.size[0] * scale), int(pil_img.size[1] * scale)), Image.LANCZOS)
-            if pil_img.size != prev_size:
-                print(f"Down sized image : {prev_size}  --> {pil_img.size}")
-
-            contents.append(pil_img)
-
-        # Compose config (modalities, safety, and sampling)
-        gen_config = self._make_gen_config(
-            want_text=save_text,
-            safety_mode=safety_mode,
-            safety_list=safety_settings,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            seed=seed,
-            candidate_count=candidate_count,
-            max_output_tokens=max_output_tokens,
-        )
+        image = self.get_image(input_img)
+        contents.append(image)
 
         try:
             # Call the model
-            resp = self.client.models.generate_content(
-                model=self.model,
-                contents=contents,
-                config=gen_config,
-            )
+            for seed_idx in range(self.max_attempts_count):
+                # Compose config (modalities, safety, and sampling)
+                gen_config = self.gen_config
+                if seed_idx > 0:
+                    gen_config = self._make_gen_config_with_seed()
 
-            saved_paths = []
-            text_chunks = []
+                resp = self.client.models.generate_content(
+                    model=self.model,
+                    contents=contents,
+                    config=gen_config,
+                )
 
-            # Save all images and optionally the text parts
-            img_idx = 0
-            txt_path = out_dir / f"{base_stem}.txt"
-            json_path = out_dir / f"{base_stem}.json"
-            for cand in getattr(resp, "candidates", []):
-                parts = getattr(cand, "content", None)
-                parts = getattr(parts, "parts", []) if parts else []
-                for p in parts:
-                    # Image parts
-                    if getattr(p, "inline_data", None) and getattr(p.inline_data, "mime_type", "").startswith("image/"):
-                        raw = self._ensure_bytes(p.inline_data.data)
+                blocked = getattr(resp, "prompt_feedback", None) and getattr(resp.prompt_feedback, "block_reason", None)
+                save_path, text_chunks = self.save_all_images(resp, out_dir, base_stem, ext, seed_idx)
+                if save_path:  #  Success to save images
+                    return save_path, text_chunks
 
-                        if not self._looks_like_image(raw):
-                            dbg_path = out_dir / f"{base_stem}_invalid_{img_idx+1}.bin"
-                            with open(dbg_path, "wb") as f:
-                                f.write(raw if isinstance(raw, (bytes, bytearray)) else bytes(raw))
-                            print(f"[WARN] Not a valid image signature. Dumped bytes to: {dbg_path}")
-                            continue
+                # print(f"[WARN] Request blocked: {blocked}}")
+                time.sleep(1 + random.random() * 2)  # Waiting before retrying
 
-
-                        img_idx += 1
-                        img = Image.open(BytesIO(raw))
-                        img.load()
-                        out_path = out_dir / f"{base_stem}_{img_idx}{ext}"
-                        while os.path.exists(out_path):
-                            img_idx += 1
-                            out_path = out_dir / f"{base_stem}_{img_idx}{ext}"
-                        img.save(out_path)
-                        saved_paths.append(out_path)
-                        txt_path = out_dir / f"{base_stem}_{img_idx}.txt"
-                        json_path = out_dir / f"{base_stem}_{img_idx}.json"
-                    # Text parts
-                    if getattr(p, "text", None):
-                        text_chunks.append(p.text)
-
-            # Save caption file if requested
-            txt_saved = None
-            if save_text and text_chunks:
-                txt_path.write_text("\n\n---\n\n".join(text_chunks), encoding="utf-8")
-                txt_saved = txt_path
-
-            # Log results
-            if saved_paths:
-                print(f"[OK] Saved {len(saved_paths)} image(s):")
-                for pth in saved_paths:
-                    print("  -", pth.resolve())
-                
-            else:
-                # print("[INFO] No image parts returned.")
-                return None, None
-
-
-            return saved_paths, txt_saved
+            return None, None
 
         except errors.APIError as e:
             # Basic error diagnostics (helpful for quota/safety issues)
@@ -337,45 +328,31 @@ class Gemini:
             return None, None
 
 
-    def processing(self, input_img, 
-                   input_folder,
-                   output_folder,
-                   save_origin,
-                   save_option,
-                   api_semaphore,
-                   api_rate_limit,
-                   **kwargs):
+    def processing(self, input_img, api_semaphore):
+                   
         """병렬 처리를 위한 래퍼 함수 - API 제한 적용"""
         with api_semaphore:  # 동시 API 호출 수 제한
-            try:
-                time.sleep(api_rate_limit)  # API 호출 간격 제한
+            time.sleep(self.api_rate_limit)  # API 호출 간격 제한
+            
+            saved_paths, _ = self.make_image(
+                input_img=input_img,
+            )
+            
+            not_generated_files = []
+            generated_files = saved_paths
+            if not saved_paths:
+                not_generated_files.append(input_img)
+                os.makedirs(f"fail/{self.input_folder}", exist_ok=True)
+                shutil.copy(input_img, f"fail/{self.input_folder}/{os.path.basename(input_img)}")
+                print("[FAIL] Failed to generate image")
+                print(f"  - {input_img}")
+            elif self.save_origin:
+                shutil.copy(input_img, f"{self.output_folder}/{os.path.basename(input_img)}")
+                    
+            return not_generated_files, generated_files, input_img  # 파일명도 함께 반환
                 
-                saved_paths, _ = self.make_image(
-                    input_img=input_img,
-                    output_folder=output_folder,
-                    **kwargs
-                )
-                
-                not_generated_files = []
-                if not saved_paths:
-                    not_generated_files.append(input_img)
-                    os.makedirs(f"fail/{input_folder}", exist_ok=True)
-                    shutil.copy(input_img, f"fail/{input_folder}/{os.path.basename(input_img)}")
-                    print("[FAIL] No Image")
-                    print(f"  - {input_img}")
-                elif save_origin:
-                    shutil.copy(input_img, f"{output_folder}/{os.path.basename(input_img)}")
-                elif save_option:
-                    # Save the options used for this file
-                    json_path = saved_paths[0].with_suffix(".json")
-                    with open(json_path, "w", encoding="utf-8") as jf:
-                        json.dump(kwargs, jf, ensure_ascii=False, indent=4)
-                        
-                return not_generated_files, input_img  # 파일명도 함께 반환
-                
-            except Exception as e:
-                print(f"[ERROR] Failed to process {input_img}: {e}")
-                return [input_img], input_img
+
+
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Gemini Flash Image Generation/Editing Example")
@@ -383,22 +360,24 @@ if __name__ == "__main__":
     parser.add_argument("--input-folder", default="Inputs", help="Path to the input image file")
     parser.add_argument("--api-key-file", default="./gemini_api_key.txt", help="Path to the API key file")
     parser.add_argument("--model", default="gemini-2.5-flash-image-preview", help="Model to use for image generation")
-    parser.add_argument("--top-p", type=float, default=0.7, help="Nucleus sampling probability")
+    parser.add_argument("--top-p", type=float, default=0.9, help="Nucleus sampling probability")
+    parser.add_argument("--top-k", type=float, default=None, help="Nucleus sampling probability")
     parser.add_argument("--temperature", type=float, default=0.6, help="Sampling temperature")
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
     parser.add_argument("--safety-mode", default="off", choices=["off", "relaxed", "balanced", "strict"], help="Safety mode")
     parser.add_argument("--save-text", action="store_true", help="Whether to save text captions")
-    parser.add_argument("--save-option", action="store_true", help="Whether to save options")
+    parser.add_argument("--save-args", action="store_true", help="Whether to save options")
     parser.add_argument("--save-origin", action="store_true", help="Whether to save original image")
     parser.add_argument("--prompt", type=str, default=None, help="Override default prompt")
     parser.add_argument("--max-workers", type=int, default=3, help="Maximum number of concurrent threads")
     parser.add_argument("--api-rate-limit", type=float, default=0.5, help="Minimum interval between API calls (seconds)")
+    parser.add_argument("--max-attempts-count", type=int, default=1, help="Maximum number of attempts")
     args = parser.parse_args()
     if args.seed is None:
         args.seed = random.randint(1, 2**31 - 1)
 
 
-    g = Gemini(api_key_file=args.api_key_file, model=args.model)
+    g = GeminiBatchImageGenerator(**vars(args))
 
     EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff", ".heic", ".heif", ".avif"}
     files = sorted(
@@ -412,10 +391,26 @@ if __name__ == "__main__":
     print(f"Found {len(files)} image files. Processing with max {args.max_workers} concurrent threads...")
     print(f"API rate limit: {args.api_rate_limit}s between calls")
     
+
+    os.makedirs(args.output_folder, exist_ok=True)
+    if args.save_args:
+        if args.prompt == None:
+            args.prompt = g.default_prompt
+        # Save the options used for this file
+        json_path = Path(args.output_folder) / f"options.json"
+        idx = 1
+        while os.path.exists(json_path):
+            json_path = Path(args.output_folder) / f"options_{idx}.json"
+            idx += 1
+        now = time.localtime()
+        args.create_time = time.strftime("%Y-%m-%d %H:%M:%S", now)
+        with open(json_path, "w", encoding="utf-8") as jf:
+            json.dump(vars(args), jf, ensure_ascii=False, indent=4)
+
     # API 호출 제한을 위한 세마포어 생성
     api_semaphore = threading.Semaphore(args.max_workers)
-    
     not_generated_files = []
+    generated_files = []
     # 병렬 처리 with ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
         # 모든 작업 제출
@@ -424,25 +419,35 @@ if __name__ == "__main__":
                 g.processing,
                 input_img=file,
                 api_semaphore=api_semaphore,
-                **vars(args),
             ): file for file in files
         }
         
         # 완료된 작업들 처리
         completed = 0
+        check_file = []
         for future in as_completed(future_to_file):
+            check_file.append(future)
             file = future_to_file[future]
             completed += 1
             try:
-                failed_files, processed_file = future.result()
+                failed_files, gen_files, processed_file = future.result()
                 not_generated_files.extend(failed_files)
+                generated_files.extend(gen_files)
             except Exception as e:
                 not_generated_files.append(file)
-                print(f"[{completed}/{len(files)}] Failed: {os.path.basename(file)} - {e}")
+                # print(f"[{completed}/{len(files)}] Failed: {os.path.basename(file)} - {e}")
+
+    if args.save_args:
+        args.generated_files = [str(d) for d in generated_files]
+        with open(json_path, "w", encoding="utf-8") as jf:
+            json.dump(vars(args), jf, ensure_ascii=False, indent=4)
+
 
     print(f"\nProcessing completed!")
-    print(f"Successfully processed: {len(files) - len(not_generated_files)}/{len(files)}")
+    print(f"Successfully processed: {len(files) - len(set(not_generated_files))}/{len(files)}")
     if not_generated_files:
-        print(f"Failed files: {set(os.path.basename(f) for f in not_generated_files)}")
+        print(f"Failed files: ")
+        for f in set(not_generated_files):
+            print(f"{os.path.join(args.input_folder, os.path.basename(f))}")
     else:
         print("All files processed successfully!")
