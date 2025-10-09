@@ -85,9 +85,10 @@ python main.py \
   --temperature 0.6 \
   --seed 1234567 \
   --safety-mode balanced \
+  --max-workers 7 \
+  --max-attempts-count 15 \
   --save-text \
   --save-option \
-  --prompt "Natural daylight, full‑body figure on a computer desk; faces crisp; subtle reflections"
 ```
 
 **Arguments**
@@ -104,6 +105,7 @@ python main.py \
 - `--save-option` (flag) — save a JSON dump of the CLI args next to the _first_ saved image for each input
 - `--save-origin` (flag) — save the original image along with the output image
 - `--max-workers` (int, defaut: 3) — The number of data processed at once
+- `--max-attempts-count` (int, defaut: 1) — The number of attempts (number of retries if failed)
   > Tip: run `python main.py -h` to see help.
 
 ---
