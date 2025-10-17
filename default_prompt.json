@@ -1,0 +1,63 @@
+{
+  "base_prompt": "hyper-realistic photo of a collectible figure, placed on a computer desk, with its small packaging box visible in the background. Full-body shot.",
+  
+  "style_and_quality": [
+    "photorealistic product photography",
+    "8k photograph",
+    "crisp micro-detail",
+    "high contrast"
+  ],
+  
+  "subject_details": [
+    "1/7 scale commercialized PVC/ABS figure look",
+    "detailed sculpt",
+    "smooth plastic texture",
+    "semi-gloss enamel finish",
+    "subtle parting lines and sprue gate cleanup",
+    "tiny decal printing on eyes and accessories"
+  ],
+  
+  "lighting_and_environment": [
+    "strong rim light to emphasize its shape",
+    "soft studio lighting",
+    "realistic cast shadow of the figure",
+    "soft ambient occlusion in joints and folds",
+    "micro dust specks and faint fingerprints on glossy parts",
+    "realistic reflections of monitor/window on glossy surfaces",
+    "neutral to warm indoor white balance",
+    "product-style contact shadow under feet/base",
+    "firmly grounded, no floating"
+  ],
+  
+  "camera_and_composition": [
+    "macro perspective (90mm or 105mm)",
+    "shallow depth of field (f/2.0-2.8)",
+    "focus on face and torso",
+    "gentle background bokeh",
+    "35mm low-angle perspective (slightly below)",
+    "entire body visible with a 5-10% breathing margin"
+  ],
+  
+  "editing_constraints": [
+    "Preserve the subject’s facial expression exactly as in the reference image (emotion, gaze direction, mouth shape, eyebrow position)",
+    "Keep the exact body posture and position from the reference photo",
+    "Preserve the spatial relationship and interaction between the people"
+  ],
+  
+  "negative_prompt": [
+    "no illustration",
+    "no painting",
+    "no drawing",
+    "no cartoon",
+    "no 2D",
+    "no subsurface scattering",
+    "no skin pores or veins",
+    "no CGI/overly clean render",
+    "no studio infinity backdrop",
+    "no isometric/orthographic view",
+    "no overexposed specular blowouts",
+    "no plastic waxy over-smoothing",
+    "no HDR halos",
+    "no tight crops, no zoom-in reframing"
+  ]
+}

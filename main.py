@@ -18,11 +18,31 @@ from google.genai import errors
 from google import genai
 from PIL import Image
 
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(filename)s:%(lineno)d %(funcName)s - %(message)s"
+)
+log = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)  
+# 시끄러운 외부 로거 억제
+for name in (
+    "google_genai", "google_genai.models", "google_genai._client",
+    "google.genai",  "google.genai.models",  "google.genai._client",
+    "httpx"
+):
+    lg = logging.getLogger(name)
+    lg.setLevel(logging.WARNING)
+    lg.propagate = False  # 상위(루트)로 전파 차단
+
+
+
 SafetyList = List[Dict[str, str]]
 
 class GeminiBatchImageGenerator:
     def __init__(self,  api_key_file, input_folder, output_folder, model, top_p, top_k, temperature, seed, safety_mode, save_text,
-                 save_origin, api_rate_limit, max_attempts_count, prompt=None, safety_settings = None, **kwargs):
+                 save_origin, api_rate_limit, max_attempts_count, prompt=None, safety_settings = None, skip_existing=False, **kwargs):
 
         # Initialize instance variables
         self.input_folder = input_folder
@@ -38,13 +58,13 @@ class GeminiBatchImageGenerator:
         self.api_rate_limit = api_rate_limit
         self.max_attempts_count = max_attempts_count
         self.model = model
-
+        self.skip_existing = skip_existing
         # Load API key and default prompt
         self.api_key = self._load_api_key(api_key_file)
         self.client = genai.Client(api_key=self.api_key)
 
         if prompt is None:
-            self.default_prompt = self._load_default_prompt("default_prompt.txt")
+            self.default_prompt = self._load_default_prompt("default_prompt.json")
         else:
             self.default_prompt = prompt
 
@@ -62,19 +82,40 @@ class GeminiBatchImageGenerator:
         self.gen_config = self._make_gen_config()
         return self._make_gen_config()
 
-
     def _load_api_key(self, file_path: str) -> str:
         p = Path(file_path)
         try:
             return p.read_text(encoding="utf-8-sig").strip()
         except UnicodeDecodeError:
-            return p.read_text(encoding="utf-16").strip()
+            try:
+                return p.read_text(encoding="utf-16").strip()
+            except Exception as e:
+                log.exception("Processing failed!!!")
+                raise e
 
     def _load_default_prompt(self, path: str) -> str:
-        # UTF-8 및 UTF-8 BOM 자동 처리(utf-8-sig). 줄 단위로 읽어 공백/빈줄 제거 후 공백 하나로 합치기.
-        text = Path(path).read_text(encoding="utf-8-sig")
-        merged = " ".join(line.strip() for line in text.splitlines() if line.strip())
-        return textwrap.dedent(merged).strip()
+
+        import json
+        with open(path, "r", encoding="utf-8-sig") as f:
+            data = json.load(f)
+
+
+        base_prompt = data["base_prompt"]
+
+        detail_sections = ""
+        for category, keywords in data.items():
+            if category == "base_prompt":
+                continue
+            # 카테고리 제목을 **볼드체**로 강조
+            detail_sections += f"\n\n**{category.upper()}:**\n" 
+            
+            # 각 키워드를 쉼표와 공백으로 연결하여 하나의 문자열로 합침
+            # (예: "keyword1, keyword2, keyword3")
+            detail_sections += ", ".join(keywords)
+
+        FINAL_PROMPT = base_prompt + detail_sections
+
+        return FINAL_PROMPT
 
     def _ensure_bytes(self, data):
         # Google SDK가 str(base64) 또는 bytes를 줄 수 있으니 모두 처리
@@ -84,6 +125,8 @@ class GeminiBatchImageGenerator:
             try:
                 return base64.b64decode(data, validate=True)
             except Exception:
+                log.exception("Processing failed!!!")
+
                 # 혹시 base64가 아니면 그대로 시도하게 냅둔다
                 return data.encode("utf-8", errors="ignore")
         return bytes(data)
@@ -230,9 +273,13 @@ class GeminiBatchImageGenerator:
         saved_path, text_chunk = [], []
         img_idx = 0
         txt_path = out_dir / f"{base_stem}.txt"
+        if not getattr(resp, "candidates", []):
+            return None, None
         for cand in getattr(resp, "candidates", []):
             parts = getattr(cand, "content", None)
             parts = getattr(parts, "parts", []) if parts else []
+            if parts is None or len(parts) == 0:
+                return None, None
             for p in parts:
                 # Image parts
                 if getattr(p, "inline_data", None) and getattr(p.inline_data, "mime_type", "").startswith("image/"):
@@ -265,16 +312,120 @@ class GeminiBatchImageGenerator:
         if saved_path:
             print(f"[OK] Saved {len(saved_path)} image(s) in {seed_idx+1} attempt(s):")
             for pth in saved_path:
-                print("  -", pth.resolve())
+                print("  -", str(pth.resolve()))
             if self.save_text and text_chunk:
                 txt_path.write_text("\n\n---\n\n".join(text_chunk), encoding="utf-8")
                 txt_saved = txt_path
             
 
         return saved_path, txt_saved
-        
 
-    # ---------- main ----------
+    def _generate_noise(self, image, noise_level=10, alpha=0.2):
+        """Generate a noise image of the given size."""
+        size = image.size
+        width, height = size
+        noise = Image.effect_noise((width, height), noise_level).convert("RGB")
+        # noise + image
+        noise_image = Image.blend(image, noise, alpha)
+        return noise_image
+
+    def mask_random_patches(self, image: Image.Image, patch_size: int = 32, mask_ratio: float = 0.15, mask_color: tuple = (0, 0, 0)) -> Image.Image:
+        """
+            PIL 이미지를 패치 단위로 자르고 랜덤하게 일부 패치를 마스킹합니다.
+            
+            Args:
+                image: PIL Image 객체
+                patch_size: 패치 크기 (정사각형)
+                mask_ratio: 마스킹할 패치 비율 (0.0 ~ 1.0)
+                mask_color: 마스킹에 사용할 색상 (R, G, B)
+            
+            Returns:
+                마스킹된 PIL Image 객체
+        """
+        from PIL import ImageDraw
+        
+        # 이미지 복사본 생성
+        masked_image = image.copy()
+        width, height = masked_image.size
+        
+        # 패치 개수 계산
+        patches_x = width // patch_size
+        patches_y = height // patch_size
+        total_patches = patches_x * patches_y
+        
+        # 마스킹할 패치 개수 계산
+        num_masks = int(total_patches * mask_ratio)
+        
+        # 모든 패치 위치 생성
+        patch_positions = []
+        for y in range(patches_y):
+            for x in range(patches_x):
+                patch_positions.append((x * patch_size, y * patch_size))
+        
+        # 랜덤하게 마스킹할 패치 선택
+        mask_positions = random.sample(patch_positions, min(num_masks, len(patch_positions)))
+        
+        # 선택된 패치들을 마스킹
+        draw = ImageDraw.Draw(masked_image)
+        for x, y in mask_positions:
+            # 패치 영역을 마스킹 색상으로 채우기
+            draw.rectangle(
+                [x, y, x + patch_size, y + patch_size], 
+                fill=mask_color
+            )
+        
+        print(f"[INFO] Masked {len(mask_positions)}/{total_patches} patches ({mask_ratio:.1%})")
+        return masked_image
+
+    def create_patch_grid_mask(self, image: Image.Image, patch_size: int = 32, mask_pattern: str = "random", mask_ratio: float = 0.15) -> Image.Image:
+        """
+        다양한 패턴으로 패치 마스킹을 적용합니다.
+        
+        Args:
+            image: PIL Image 객체
+            patch_size: 패치 크기
+            mask_pattern: 마스킹 패턴 ("random", "checkerboard", "stripes")
+        
+        Returns:
+            마스킹된 PIL Image 객체
+        """
+        from PIL import ImageDraw
+        
+        masked_image = image.copy()
+        width, height = masked_image.size
+        draw = ImageDraw.Draw(masked_image)
+        
+        patches_x = width // patch_size
+        patches_y = height // patch_size
+        if image.mode != "RGB":
+            mask_color = (128, 128, 128)  # 회색 마스크
+        elif image.mode == "RGBA":
+            mask_color = (128, 128, 128, 255)  # 회색 마스크
+        elif image.mode == "L":
+            mask_color = 128  # 회색 마스크
+        else:
+            mask_color = (0, 0, 0)  # 검정색 마스크
+        for y in range(patches_y):
+            for x in range(patches_x):
+                should_mask = False
+                
+                if mask_pattern == "random":
+                    should_mask = random.random() < mask_ratio  # 15% 확률
+                elif mask_pattern == "checkerboard":
+                    should_mask = (x + y) % 2 == 0
+                elif mask_pattern == "stripes":
+                    should_mask = x % 3 == 0  # 3칸마다 마스킹
+                
+                if should_mask:
+                    patch_x = x * patch_size
+                    patch_y = y * patch_size
+                    draw.rectangle(
+                        [patch_x, patch_y, patch_x + patch_size, patch_y + patch_size],
+                        fill=mask_color
+                    )
+        
+        return masked_image
+
     def make_image(self, input_img: Union[str, Path, Image.Image, None], prompt: Optional[str] = None):
         if prompt is None:
             prompt = self.default_prompt
@@ -287,50 +438,68 @@ class GeminiBatchImageGenerator:
         image = self.get_image(input_img)
         contents.append(image)
 
-        try:
-            # Call the model
-            for seed_idx in range(self.max_attempts_count):
-                # Compose config (modalities, safety, and sampling)
-                gen_config = self.gen_config
-                if seed_idx > 0:
-                    gen_config = self._make_gen_config_with_seed()
-
+        # Call the model
+        for seed_idx in range(self.max_attempts_count):
+            # Compose config (modalities, safety, and sampling)
+            gen_config = self.gen_config
+            if seed_idx > 0:
+                gen_config = self._make_gen_config_with_seed()
+                
+                # add noisy into image
+                # noise = self._generate_noise(image, alpha=0.5)
+                patch_size = min(image.width, image.height) // 32
+                contents[-1] = self.create_patch_grid_mask(image, patch_size=patch_size, mask_pattern="random", mask_ratio=0.10)
+                # contents[-1] = self._generate_noise(image, alpha=0.3)
+            try:
                 resp = self.client.models.generate_content(
                     model=self.model,
                     contents=contents,
                     config=gen_config,
                 )
-
+            except errors.APIError as e:
+                if getattr(e,'code',None) == 500:
+                    print(f"[APIError] code={getattr(e,'code',None)} message={getattr(e,'message','')} {input_img} Retrying...")
+                    time.sleep(2 + random.random() * 4)  # Waiting before retrying
+                    continue
+                elif getattr(e,'code',None) == 429:
+                    # Basic error diagnostics (helpful for quota/safety issues)
+                    print(f"[APIError] code={getattr(e,'code',None)} message={getattr(e,'message','')}")
+                    print(f"\tmessage: {getattr(e, 'message', '')}")
+                    print(f"\tdetails: {getattr(e, 'details', '')}")
+                    return None, None
+                else:
+                    # Basic error diagnostics (helpful for quota/safety issues)
+                    print(f"[APIError] code={getattr(e,'code',None)} message={getattr(e,'message','')}")
+                    print(f"\tmessage: {getattr(e, 'message', '')}")
+                    print(f"\tdetails: {getattr(e, 'details', '')}")
+                    return None, None
+            if resp is not None:
                 blocked = getattr(resp, "prompt_feedback", None) and getattr(resp.prompt_feedback, "block_reason", None)
                 save_path, text_chunks = self.save_all_images(resp, out_dir, base_stem, ext, seed_idx)
+
+
                 if save_path:  #  Success to save images
                     return save_path, text_chunks
 
                 # print(f"[WARN] Request blocked: {blocked}}")
                 time.sleep(1 + random.random() * 2)  # Waiting before retrying
 
-            return None, None
+        return None, None
 
-        except errors.APIError as e:
-            # Basic error diagnostics (helpful for quota/safety issues)
-            print(f"[APIError] code={getattr(e,'code',None)} message={getattr(e,'message','')}")
-            print(f"\tmessage: {getattr(e, 'message', '')}")
-            print(f"\tdetails: {getattr(e, 'details', '')}")
-            data = getattr(e, "response_json", {}) or {}
-            details = data.get("error", {}).get("details", [])
-            for d in details:
-                t = d.get("@type","")
-                if t.endswith("QuotaFailure"):
-                    viols = [v.get("quotaId","") for v in d.get("violations",[])]
-                    print("[Quota Violations]", viols)
-                if t.endswith("RetryInfo") and "retryDelay" in d:
-                    print("[RetryInfo]", d["retryDelay"])
-            return None, None
 
 
     def processing(self, input_img, api_semaphore):
                    
         """병렬 처리를 위한 래퍼 함수 - API 제한 적용"""
+
+        _, base_stem, ext = self._base_out(input_img)
+
+        output_check = Path(self.output_folder)
+        output_check = output_check / f"{base_stem}_{1}{ext}"
+        if self.skip_existing and output_check.exists():
+            print(f"[SKIP] Already exists: {output_check}")
+            return [], [output_check], input_img
+
         with api_semaphore:  # 동시 API 호출 수 제한
             time.sleep(self.api_rate_limit)  # API 호출 간격 제한
             
@@ -342,16 +511,19 @@ class GeminiBatchImageGenerator:
             generated_files = saved_paths
             if not saved_paths:
                 not_generated_files.append(input_img)
-                os.makedirs(f"fail/{self.input_folder}", exist_ok=True)
-                shutil.copy(input_img, f"fail/{self.input_folder}/{os.path.basename(input_img)}")
+                fail_dir = Path(f"fail/{self.input_folder}")
+                fail_file = fail_dir / os.path.basename(input_img)
+                os.makedirs(fail_dir, exist_ok=True)
+                shutil.copy(input_img, fail_file)
                 print("[FAIL] Failed to generate image")
                 print(f"  - {input_img}")
             elif self.save_origin:
                 shutil.copy(input_img, f"{self.output_folder}/{os.path.basename(input_img)}")
                     
             return not_generated_files, generated_files, input_img  # 파일명도 함께 반환
-                
-
+        
+        print("Should not reach here")
+        return [], [], input_img  # 파일명도 함께 반환
 
 if __name__ == "__main__":
 
@@ -368,6 +540,7 @@ if __name__ == "__main__":
     parser.add_argument("--save-text", action="store_true", help="Whether to save text captions")
     parser.add_argument("--save-args", action="store_true", help="Whether to save options")
     parser.add_argument("--save-origin", action="store_true", help="Whether to save original image")
+    parser.add_argument("--skip-existing", action="store_true", help="Whether to skip existing output files")
     parser.add_argument("--prompt", type=str, default=None, help="Override default prompt")
     parser.add_argument("--max-workers", type=int, default=3, help="Maximum number of concurrent threads")
     parser.add_argument("--api-rate-limit", type=float, default=0.5, help="Minimum interval between API calls (seconds)")
@@ -379,11 +552,11 @@ if __name__ == "__main__":
 
     g = GeminiBatchImageGenerator(**vars(args))
 
-    EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff", ".heic", ".heif", ".avif"}
+    EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff", ".heic", ".heif", ".avif"}  # , ".gif"
     files = sorted(
             str(p) for p in Path(args.input_folder).rglob("*")
             if p.is_file() and p.suffix.lower() in EXTS
-    )
+    ) # * 3
     if not files:
         print(f"No image files found in {args.input_folder}")
         exit(0)
@@ -432,10 +605,24 @@ if __name__ == "__main__":
             try:
                 failed_files, gen_files, processed_file = future.result()
                 not_generated_files.extend(failed_files)
-                generated_files.extend(gen_files)
-            except Exception as e:
+                if gen_files:
+                    generated_files.extend(gen_files)
+                else:
+                    shutil.copy(file, f"fail/{args.input_folder}/{os.path.basename(file)}")
+
+            except TypeError as e:
+                log.exception("Processing failed!!!")
+                print(f"[{completed}/{len(files)}] TypeError for {file}: {e}")
                 not_generated_files.append(file)
-                # print(f"[{completed}/{len(files)}] Failed: {os.path.basename(file)} - {e}")
+                os.makedirs(f"fail/{args.input_folder}", exist_ok=True)
+                shutil.copy(file, f"fail/{args.input_folder}/{os.path.basename(file)}")
+
+            except Exception as e:
+                log.exception("Processing failed!!!")
+                print(f"[{completed}/{len(files)}] Exception for {file}: {e}")
+                shutil.copy(file, f"fail/{args.input_folder}/{os.path.basename(file)}")
+                not_generated_files.append(file)
+                print(f"[{completed}/{len(files)}] Failed: {os.path.basename(file)} - {e}")
 
     if args.save_args:
         args.generated_files = [str(d) for d in generated_files]
